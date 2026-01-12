@@ -1,0 +1,796 @@
+---
+title: "Project3_JessicaSinha.R"
+output: html_document
+date: "2025-07-19"
+---
+
+## R Markdown Setup
+
+```{r setup, include=FALSE}
+
+# Set global chunk options for the R Markdown document
+# - echo = TRUE: Show code in output unless overridden
+# - message = FALSE: Suppress package loading and other messages
+# - warning = FALSE: Suppress warnings from code execution
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+# Uncomment the following lines if packages are not yet installed:
+
+# install.packages("janitor")
+# install.packages("dplyr")
+# install.packages("stringr")
+# install.packages("readr")
+# install.packages("tidyverse")
+# install.packages("knitr")
+# install.packages("lubridate")
+# install.packages("gt")
+# install.packages("broom")
+
+# Load libraries
+
+library(tidyverse)
+library(janitor)
+library(knitr)
+library(lubridate)
+library(readr)
+library(dplyr)
+library(gt)
+library(broom)
+library(ggplot2)
+
+```
+
+## Importing the MIMIC IV Clinical Demo dataset
+
+```{r import the MIMIC IV dataset, echo=FALSE, include = FALSE, message=FALSE, warning=FALSE}
+
+# Set the path to the MIMIC-IV demo v2.2 dataset folder
+
+path <- "mimic-iv-clinical-database-demo-2.2"
+
+# Import tables from the hosp folder
+
+icd_diagnoses            <- readr::read_csv(file.path(path, "hosp/d_icd_diagnoses.csv.gz"))
+patients_diagnoses       <- readr::read_csv(file.path(path, "hosp/diagnoses_icd.csv.gz"))
+patients                 <- readr::read_csv(file.path(path, "hosp/patients.csv.gz"))
+omr                      <- readr::read_csv(file.path(path, "hosp/omr.csv.gz"))
+
+```
+
+## Join the relevant tables
+
+```{r join_all_tables, echo=FALSE,include = FALSE, message=FALSE, warning=FALSE}
+
+# Create a copy of the patients dataset to preserve it.
+# The rest of the tables will be joined to it.
+
+patients_data <- patients
+dim(patients_data)
+# 100 rows and 6 columns.
+
+# Trim whitespace in all character columns.
+
+patients_data <- patients_data %>%
+  mutate(across(where(is.character), ~ trimws(.)))
+
+# Check for duplicated subject IDs.
+
+sum(duplicated(patients_data$subject_id))
+# there were no any duplicated subject_ids.
+
+# Add patient diagnoses.
+
+patients_data <- patients_data %>%
+  left_join(patients_diagnoses, by = "subject_id")
+
+# View patients_data.
+
+print(head(patients_data))
+dim(patients_data) 
+# 4506 rows and 10 columns.
+# This is because there are multiple diagnoses for each patient.
+
+# Keep only primary diagnoses.
+
+patients_data <- patients_data %>%
+  filter(seq_num == 1)
+
+# Add diagnosis descriptions to patient-level data.
+
+patients_data <- patients_data %>%
+  left_join(icd_diagnoses, by = c("icd_code", "icd_version"))
+
+dim(patients_data)
+# the final joint table has 275 rows and 11 columns.
+
+```
+
+## Data Quality Checks on Patients Data
+
+```{r initial_exploration_patients, results = 'hide', include = FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+
+# 1. Inspect structure: column names, data types, and sample values.
+
+str(patients_data)
+# - The "patients_data" table is a tibble with 275 rows and 11 columns.
+# - It contains character, numerical, and date columns.
+
+# 2. Summary statistics for all columns
+
+summary(patients_data)
+# - Summary statistics show that several variables contain missing values, 
+# - "dod" (date of death) has 172 NAs.
+# - The large number of missing values are  due to patient-level duplication introduced during the left join, 
+# - where a single "subject_id" matched to multiple diagnoses in the linked tables.
+
+# 3. Check column names for formatting issues.
+
+names(patients_data)
+# - Column names do not contain formatting issues, they are in snake_case format.
+# - Some of the names are ambiguous ( e.g., seq_num).
+
+# 4. Check for missing values.
+
+colSums(is.na(patients_data))
+# - dod has 172 missing values.
+
+# 5. Check for duplicate rows.
+
+sum(duplicated(patients_data))
+# - There were no duplicated rows.
+
+# 6. Check for duplicated subject_id.
+
+sum(duplicated(patients_data$subject_id))
+# - 175 duplicated subject IDs. This is because patients had multiple diagnoses
+# - and their ID was duplicated during left join with icd diagnoses.
+
+# 7. Check for age range to ensure that there is no age less than 0 or greater than 120.
+
+summary(patients_data$anchor_age)
+# - The minimum age is 21 and maximum age is 91. 
+
+# 8. View the ICD version data.
+
+summary(patients_data$icd_version)
+# - The ICD version is either 9 or 10.
+
+# 9. View the  biological gender 
+
+table(patients_data$gender)
+# - There are 133 females and 142 males.
+
+# 10. Check for special characters in each column.
+
+special_chars <- function(df) {
+  get_special_chars <- function(column) {
+    all_text <- paste(as.character(column), collapse = "")
+    chars <- unlist(strsplit(all_text, ""))
+    specials <- chars[grepl("[^A-Za-z0-9 ]", chars)]
+    unique(specials)
+  }
+  
+  for (col_name in names(df)) {
+    cat("\nSpecial characters in column:", col_name, "\n")
+    specials <- get_special_chars(df[[col_name]])
+    if (length(specials) > 0) {
+      print(specials)
+    } else {
+      cat("None found.\n")
+    }
+  }
+}
+special_chars(patients_data)
+# - special characters were found in anchor_year_group ("-"), dod ("-"), 
+# - and long_title ("," "(" ")" "[" "]" "-" ".") columns. 
+
+# 11. Convert the long_title of diseases to lower case for consistency
+
+patients_data <- patients_data %>%
+  mutate(long_title = tolower(long_title))
+        
+# 12.Rename sequence number column for clarity
+
+patients_data <- patients_data %>%
+  rename(
+    seq_num_diagnose = seq_num
+  )
+
+# View column names
+names(patients_data)
+
+```
+
+## Data Quality Check on Outpatient Measurements
+
+```{r dq_outpatient_measurements, results = 'hide', include = FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Create a copy of the file to preserve the orignial
+
+outpatient_measurements <- omr
+
+# 1. View the structure.
+
+str(outpatient_measurements) 
+# - There are 2,964 rows and 5 columns.
+
+# 2. Summary statistics.
+
+summary(outpatient_measurements)
+# - subject_id and seq_num is a number, chartdate is a date, and result_name and
+# - result_value are characters.
+
+# 3. Check column names.
+names(outpatient_measurements)
+# - There are no formatting issues.
+
+# 4. Check for missing values.
+
+colSums(is.na(outpatient_measurements))
+# - There are no missing values.
+
+# 5. Check for duplicate rows
+
+sum(duplicated(outpatient_measurements))
+# - No duplicate rows
+
+# 6. Check for duplicated subject_id.
+
+sum(duplicated(patients_data$subject_id))
+# - There are 175 duplicated subject IDs because some subjects had multiple 
+# - entries for outpatient measurements. 
+
+# 7. Check for the special characters
+
+SpecialChars <- function(df) {
+  get_special_chars <- function(column) {
+    all_text <- paste(as.character(column), collapse = "")
+    chars <- unlist(strsplit(all_text, ""))
+    specials <- chars[grepl("[^A-Za-z0-9 ]", chars)]
+    unique(specials)
+  }
+  
+  for (col_name in names(df)) {
+    cat("\nSpecial characters in column:", col_name, "\n")
+    specials <- get_special_chars(df[[col_name]])
+    if (length(specials) > 0) {
+      print(specials)
+    } else {
+      cat("None found.\n")
+    }
+  }
+}
+SpecialChars(outpatient_measurements)
+# - This table contains special characters: "()", "-", "/"
+
+# Convert result_name to lowercase for consistency
+
+outpatient_measurements <- outpatient_measurements %>%
+  mutate(result_name = tolower(result_name))
+
+```
+
+## Deriving Pulse Pressure
+
+```{r calculate_pulse_pressure, message=FALSE, warning=FALSE}
+
+# - This code calculate pulse pressure for rows where result_name is "Blood Pressure".
+# - Pulse Pressure = Systolic - Diastolic.
+# - sub(".*/", "", result_value)` extracts the diastolic (after the slash).
+# - sub("/.*", "", result_value)` extracts the systolic (before the slash).
+# - It then converts both characters to numeric and subtracts them, and assigns NA to other rows.
+
+outpatient_measurements <- outpatient_measurements %>%
+  mutate(
+    pulse_pressure = case_when(
+      result_name == "blood pressure" ~ as.numeric(sub("/.*", "", result_value)) - 
+                                         as.numeric(sub(".*/", "", result_value)),
+      TRUE ~ NA_real_
+    )
+  )
+
+# View a sample of calculated pulse pressure values
+
+outpatient_measurements %>%
+  filter(result_name == "blood pressure") %>%
+  select(result_value, pulse_pressure) %>%
+  head(5)
+
+
+
+```
+
+## Cardiovascular Disease Terms
+
+```{r mapping, include = FALSE, message=FALSE, warning=FALSE}
+
+# Cardiovascular key terms were obtained from: https://www.ncbi.nlm.nih.gov/mesh/68002318
+
+raw_cvd_terms <- ("Cardiovascular Disease
+Disease, Cardiovascular
+Cardiac Events
+Cardiac Event
+Event, Cardiac
+Adverse Cardiac Event
+Adverse Cardiac Events
+Cardiac Event, Adverse
+Cardiac Events, Adverse
+Major Adverse Cardiac Events
+All MeSH Categories
+Diseases Category
+Cardiovascular Diseases
+Cardiovascular Abnormalities
+Heart Defects, Congenital +
+Vascular Malformations +
+Cardiovascular Infections
+Endocarditis, Bacterial +
+Syphilis, Cardiovascular
+Tuberculosis, Cardiovascular +
+Heart Diseases
+Arrhythmias, Cardiac +
+Carcinoid Heart Disease
+Cardiac Conduction System Disease +
+Cardiac Output, High
+Cardiac Output, Low
+Cardiac Tamponade
+Cardiomegaly +
+Cardiomyopathies +
+Cardiotoxicity
+Endocarditis +
+Heart Aneurysm
+Heart Arrest +
+Heart Defects, Congenital +
+Heart Failure +
+Heart Neoplasms +
+Heart Rupture +
+Heart Valve Diseases +
+Myocardial Ischemia +
+Myocardial Stunning
+Pericardial Effusion
+Pericarditis +
+Pneumopericardium
+Post-Cardiac Arrest Syndrome
+Postpericardiotomy Syndrome
+Pulmonary Heart Disease
+Rheumatic Heart Disease
+Ventricular Dysfunction +
+Ventricular Outflow Obstruction +
+Pregnancy Complications, Cardiovascular
+Embolism, Amniotic Fluid
+Peripartum Cardiomyopathy
+Vascular Diseases
+Aneurysm +
+Aneurysm, False
+Angiodysplasia +
+Angioedema +
+Angiomatosis +
+Aortic Diseases +
+Arterial Occlusive Diseases +
+Arteriovenous Malformations +
+Capillary Leak Syndrome
+Cerebrovascular Disorders +
+Colitis, Ischemic
+Compartment Syndromes +
+mDiabetic Angiopathies +
+Embolism and Thrombosis +
+Hand-Arm Vibration Syndrome
+Hemorrhoids
+Hemostatic Disorders +
+Hepatic Veno-Occlusive Disease
+Hyperemia
+Hypertension +
+Hypotension +
+Mesenteric Ischemia
+Myocardial Ischemia +
+Optic Neuropathy, Ischemic
+Peliosis Hepatis
+Penetrating Atherosclerotic Ulcer
+Peripheral Vascular Diseases +
+Prehypertension
+Pulmonary Veno-Occlusive Disease
+Reperfusion Injury +
+Retinal Vein Occlusion
+Scimitar Syndrome
+Spinal Cord Vascular Diseases +
+Splenic Infarction
+Stenosis, Pulmonary Vein
+Superior Vena Cava Syndrome
+Telangiectasis +
+Thoracic Outlet Syndrome +
+Varicocele
+Varicose Veins +
+Vascular Fistula +
+Vascular Neoplasms
+Vascular System Injuries
+Vasculitis +
+Vasoplegia
+Venous Insufficiency +"
+)
+
+# Clean and split cardiovascular key words into proper character vector.
+
+cleaned_cvd_terms <- raw_cvd_terms |>
+  strsplit("\n") |>                        # Split text into individual lines.
+  unlist() |>                              # Flatten the list into one vector.
+  trimws() |>                              # Remove leading/trailing spaces.
+  tolower() |>                             # Convert to lowercase.
+  gsub("[[:punct:]]", " ", x = _) |>       # Replace all punctuation with space.
+  strsplit("\\s+") |>                      # Split each line into words.
+  unlist() |>                              # Flatten all lists into one vector.
+  trimws() |>                              # Clean spaces.
+  (\(x) x[nchar(x) > 0])() |>              # Remove empty strings.
+  unique()                                 # Remove duplicates.
+
+# Check cleaned terms
+
+cleaned_cvd_terms 
+
+# Remove irrelevant terms
+
+cleaned_cvd_terms <- setdiff(cleaned_cvd_terms, c("event", "events", "disease", "all", "low", "false", "system", "post", "injury", "failure", "syndrome", "bacterial", "output", "hand", "neoplasm", "infections", "peripartum", "fluid", "dysfunction", "post", "syphilis", "high", "stunning", "rupture", "and"))
+
+cleaned_cvd_terms
+```
+
+## Classify diseases: Cardiovascular vs Non-Cardiovascular
+
+```{r classify_cvd, echo = FALSE, warning=FALSE}
+
+# - This code classifoes each row (cardiovascular vs non cardiovascular) based on substring match
+# - based on whether any of the cleaned CVD terms appear in the diagnosis description (`long_title`)
+
+patients_data <- patients_data %>%
+  mutate(
+    cvd_classification = ifelse(
+      sapply(
+        long_title %>%
+          str_replace_all("[[:punct:]]", ""),     # Remove all punctuation.
+        
+        function(summary) {
+          # For each cleaned CVD keyword, check if it appears in the long_title.
+          any(sapply(cleaned_cvd_terms, function(term) grepl(term, summary)))
+        }
+      ),
+      "cardiovascular",                           # Label as "cardiovascular" if there is a match.
+      "non-cardiovascular"                        # Label as "non-cardiovascular" if there is no match.
+    )
+  )
+
+# View the result
+
+patients_data %>%
+  select(subject_id, cvd_classification) %>%
+  head(5)
+
+# Count cardiovascular and non-cardiovascular diseases.
+
+cvd_counts <- patients_data %>%
+  group_by(cvd_classification) %>%
+  summarise(count = n())
+
+# Print classification statements.
+
+cvd_counts %>%
+  mutate(message = paste0("The total number of ", cvd_classification, " diseases is ", count, ".")) %>%
+  pull(message) %>%
+  cat(sep = "\n")
+
+```
+
+## Identify Outliers
+
+```{r detect_outliers_iqr, include = FALSE, message=FALSE, warning=FALSE}
+
+# Define function to detect outliers using IQR
+
+DetectOutliers <- function(data, variable_names) {
+  data %>%
+    filter(result_name %in% variable_names) %>%              # Keep only desired result types (e.g., Weight, BMI)
+    mutate(numeric_value = as.numeric(result_value)) %>%     # Convert result_value to numeric
+    group_by(result_name) %>%                                # Group by variable to calculate IQRs separately
+    mutate(
+      Q1 = quantile(numeric_value, 0.25, na.rm = TRUE),
+      Q3 = quantile(numeric_value, 0.75, na.rm = TRUE),
+      IQR = Q3 - Q1,
+      lower_bound = Q1 - 1.5 * IQR,
+      upper_bound = Q3 + 1.5 * IQR,
+      is_outlier = numeric_value < lower_bound | numeric_value > upper_bound
+    ) %>%
+    filter(is_outlier) %>%
+    ungroup()
+}
+
+# Specify variables of interest.
+
+vars_to_check <- c("bmi (kg/m2)", "height (inches)", "weight (lbs)", "pulse pressure")
+
+# Run outlier detection function 
+
+outliers_detected <- DetectOutliers(outpatient_measurements, vars_to_check)
+
+# Display outliers
+
+outliers_detected
+
+# - There is a record of BMI being 4649.40 and height being 5.0
+# - These are most likely incorrect and are not meaningful
+
+# Remove the BMI = 4649.4 and Height = 5 from outpatient_measurements
+
+outpatient_measurements <- outpatient_measurements %>%
+  filter(!(result_name == "bmi (kg/m2)" & result_value == "4649.4"),
+         !(result_name == "height (inches)" & result_value == "5"))
+
+```
+
+## Summarize BMI, Height, and Weight, Pulse Pressure for Cardiovascular Diseases
+
+```{r cvd_summary_stats, message=FALSE, warning=FALSE}
+
+# Define function to summarize outpatient measurements for a classification.
+
+Summarize0mws <- function(class_label) {
+  
+  # Filter subject_ids by classification (cardiovascular vs non-cardiovascular).
+  
+  subject_ids <- patients_data %>%
+    filter(cvd_classification == class_label) %>%
+    distinct(subject_id)
+
+  # Filter outpatient data for those patients (weight,bmi,height).
+  
+  measurements <- outpatient_measurements %>%
+    filter(subject_id %in% subject_ids$subject_id)
+
+  # Define helper function inside larger function (summarize_outpatient_measurements).
+  
+  summarize_numeric <- function(data, var_name, display_name) {
+    data %>%
+      filter(result_name == var_name) %>%                # Keep  rows where the result_name matches the variable of interest.
+      mutate(value = as.numeric(result_value)) %>%       # Convert result_value column to numeric and store as "value".
+     
+       # Calculate summary statistics for the numeric values
+       summarise(
+        n = sum(!is.na(value)),                          # Compute the number of observations (non-missing values).
+        mean = round(mean(value, na.rm = TRUE), 1),      # Compute mean.
+        median = round(median(value, na.rm = TRUE), 1),  # Compute median.
+        sd = round(sd(value, na.rm = TRUE), 1),          # Compute standard deviation.
+        min = round(min(value, na.rm = TRUE), 1),        # Compute minimum value.
+        max = round(max(value, na.rm = TRUE), 1)         # Compute maximum value.
+      ) %>%
+     
+      # Add a column to display name of the variable (e.g., "Weight (kg)").
+      mutate(variable = display_name)
+  }
+
+  # Pulse pressure summary
+  
+  summary_pulse <- measurements %>%
+    
+    # Keep only rows where pulse_pressure is not missing.
+    
+    filter(!is.na(pulse_pressure)) %>%
+    
+    summarise(
+      n = n(),                                                  # Count of non-missing values in the pulse pressure data.
+      mean = round(mean(pulse_pressure, na.rm = TRUE), 1),      # Compute mean.
+      median = round(median(pulse_pressure, na.rm = TRUE), 1),  # Compute median.
+      sd = round(sd(pulse_pressure, na.rm = TRUE), 1),          # Compute standard deviation.
+      min = round(min(pulse_pressure, na.rm = TRUE), 1),        # Compute minimum value.
+      max = round(max(pulse_pressure, na.rm = TRUE), 1)         # Compute maximum value.
+    ) %>%
+    
+    # Add a column to display name of the variable.
+    mutate(variable = "Pulse Pressure")
+
+  # Compute statistical summary for weight, bmi, and height.
+  
+  summary_weight <- summarize_numeric(measurements, "weight (lbs)", "weight (lbs)")
+  summary_bmi    <- summarize_numeric(measurements, "bmi (kg/m2)", "bmi (kg/m2)")
+  summary_height <- summarize_numeric(measurements, "height (inches)", "height (inches)")
+
+  # Combine the rows.
+  
+  summary_long <- bind_rows(
+    summary_weight,
+    summary_bmi,
+    summary_height,
+    summary_pulse
+  )
+  # Convert into a long format.
+  summary_long %>%
+    pivot_longer(cols = c(n, mean, median, sd, min, max),
+                 names_to = "statistic", values_to = "value") %>%
+    pivot_wider(names_from = variable, values_from = value)
+}
+
+# Call the function for cardiovascular and non-cardiovascular patient groups.
+cvd_summary_table <- Summarize0mws("cardiovascular")
+noncvd_summary_table <- Summarize0mws("non-cardiovascular")
+
+
+# Display statistical summary for cardiovascular patients.
+cvd_summary_table %>%
+  gt() %>%
+  tab_header(
+    title = "Summary Statistics: Cardiovascular Disease Patients"
+  )
+
+# Display statistical summary for non-cardiovascular patients.
+noncvd_summary_table %>%
+  gt() %>%
+  tab_header(
+    title = "Summary Statistics: Non-Cardiovascular Disease Patients"
+  )
+
+```
+
+## Hypothesis Testing
+
+```{r hypothesis testing, message=FALSE, warning=FALSE}
+
+# CLINICAL QUESTION
+
+# Does higher pulse pressure increase the likelihood of being classified 
+# as a cardiovascular disease patient?
+
+# Null Hypothesis (H₀):
+# There is no significant difference in pulse pressure between 
+# cardiovascular and non-cardiovascular patients.
+# (μ₁ = μ₂)
+
+# Alternative Hypothesis (H₁):
+# There is a significant difference in pulse pressure between the two groups.
+# (μ₁ ≠ μ₂)
+
+# ASSUMPTIONS:
+
+# Independence of Observations:
+# - The pulse pressure measurements for each patient are assumed to be independent
+# Normality of Distribution
+# - The distribution of pulse pressure within each group should be approximately normal
+# - given the large sample sizes in both groups (n > 30), the Central Limit Theorem applies
+# Homogeneity of Variances: 
+# - The variability of pulse pressure should be similar between groups
+
+# CHECK FOR VARTIACNE
+
+# Null Hypothesis (H₀):
+# The variances of pulse pressure are equal between cardiovascular and 
+# non-cardiovascular patients.
+# (σ₁² = σ₂²)
+
+# Alternative Hypothesis (H₁):
+# The variances of pulse pressure are not equal between the two groups.
+# (σ₁² ≠ σ₂²)
+
+# Get subject_ids for cardiovascular patients.
+cvd_subject_ids <- patients_data %>%
+  filter(cvd_classification == "cardiovascular") %>%
+  distinct(subject_id)
+
+# Get subject_ids for non-cardiovascular patients.
+noncvd_subject_ids <- patients_data %>%
+  filter(cvd_classification == "non-cardiovascular") %>%
+  distinct(subject_id)
+
+# Extract pulse pressure values for cardiovascular patients.
+cvd_pp <- outpatient_measurements %>%
+  filter(subject_id %in% cvd_subject_ids$subject_id) %>%
+  pull(pulse_pressure) %>%
+  na.omit()
+
+# Extract pulse pressure values for non-cardiovascular patients.
+noncvd_pp <- outpatient_measurements %>%
+  filter(subject_id %in% noncvd_subject_ids$subject_id) %>%
+  pull(pulse_pressure) %>%
+  na.omit()
+
+# Test for equality of variances between cardiovascular and non-cardiovascular patients.
+var.test(cvd_pp, noncvd_pp)
+
+# Result:
+# F = 1.106, p-value = 0.1778
+
+# Conclusion:
+# Since the p-value is greater than 0.05, we fail to reject the null hypothesis.
+# Therefore, we assume equal variances and proceed with a two-sample t-test
+# using var.equal = TRUE.
+
+# PERFORM A TWO SAMPLE T-TEST
+
+t_test_result <- t.test(cvd_pp, noncvd_pp, var.equal = TRUE)
+
+# View test result
+t_test_result
+
+# Reword the variable names from the t-test output for easier reading.
+tidy_ttest <- tidy(t_test_result) %>%
+  rename(
+    `mean difference` = estimate,
+    `mean (cardiovascular)` = estimate1,
+    `mean (non-cardiovascular)` = estimate2,
+    `t statistic` = statistic,
+    `p-value` = p.value,
+    `degrees of freedom` = parameter,
+    `CI lower` = conf.low,
+    `CI upper` = conf.high,
+    `test method` = method,
+    `test type` = alternative
+  )
+
+# View the t-test results in a formatted table using gt()
+tidy_ttest %>%
+  gt() %>%
+  tab_header(
+    title = "Two-Sample t-test: Pulse Pressure by Disease Classification"
+  ) %>%
+  fmt_number(columns = everything(), decimals = 3) %>%
+  cols_align(align = "left", columns = everything())
+
+# Conclusion:
+# The p-value from the t-test is 0.02586, which is less than the 0.05 significance level.
+# Therefore, we reject the null hypothesis and conclude that there is a statistically
+# significant difference in mean pulse pressure between cardiovascular and non-cardiovascular patients.
+# The mean pulse pressure for cardiovascular patients is approximately 60.01 mmHg,
+# compared to 57.90 mmHg in non-cardiovascular patients.
+# 95% CI for the difference in means is (0.25, 3.96), which does not include 0,
+# reinforcing that the difference is statistically significant.
+
+```
+
+## Graphical Representation
+
+```{r graphical representation, message=FALSE, warning=FALSE}
+
+# Combine pulse pressure and group labels (cardiovascular and non-cardiovascular) into one data frame.
+pulse_data <- data.frame(
+  pulse_pressure = c(cvd_pp, noncvd_pp),
+  group = c(rep("Cardiovascular", length(cvd_pp)),
+            rep("Non-Cardiovascular", length(noncvd_pp)))
+)
+
+# Create boxplot with jittered points to visualize pulse pressure by group (cardiovascular and non-cardiovascular).
+ggplot(pulse_data, aes(x = group, y = pulse_pressure, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.2, alpha = 0.3, color = "black") +
+  scale_y_continuous(
+    name = "Pulse Pressure (mmHg)",
+    breaks = seq(0, 150, by = 25),     # Set tick marks every 25 mmHg
+    limits = c(0, 140)                 # Set y-axis limits to 0 and 140
+  ) +
+  labs(
+    title = "Pulse Pressure by Disease Classification",
+    x = "Disease Classification"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",                              # Hide legend
+    axis.title.x = element_text(margin = margin(t = 10)),  # Add space below x-axis label
+    plot.title = element_text(hjust = 0.5)                 # Center title
+  )
+
+
+# This boxplot compares the distribution of pulse pressure between patients 
+# with cardiovascular disease and those without. Each box represents the 
+# interquartile range (IQR) of pulse pressure for each group (25th to 75th percentile), 
+# and the horizontal line inside the box shows the median, which corresponds to the 
+# 50th percentile (also called the 2nd quartile). Jittered black dots represent individual 
+# observations, helping to visualize the spread and density of the data. 
+# Overall, the plot shows that patients with cardiovascular disease tend to have 
+# slightly higher pulse pressure compared to non-cardiovascular patients.
+
+```
+
+## Discussion
+
+This project used four MIMIC-IV tables: “patients”, “diagnoses_icd”, “d_icd_diagnoses”, and “omr”. Patient demographics were linked with diagnosis codes and descriptions to identify disease types, while outpatient measurements were used to extract clinical values such as bmi, weight, blood pressure, and height. The patients were classified based on cardiovascular versus non-cardiovascular disease and this was derived by matching cleaned diagnosis descriptions against a list of cardiovascular-related terms obtained from the National Library of Medicine. Furthermore, pulse pressure was calculated from the outpatient blood pressure values by subtracting the diastolic value from the systolic value.
+
+This data analysis explored whether there is statistically significant difference in pulse pressure  between patients with cardiovascular and non-cardiovascular diseases. The null hypothesis stated that there is no difference in pulse pressure between cardiovascular and non-cardiovascular patients (μ₁ = μ₂), while the alternate hypothesis stated that there is a difference (μ₁ ≠ μ₂). To test against the null hypothesis, a two-sample t-test was conducted, and the resulting p-value was 0.026. Considering a significance level of α = 0.05, the p-value is statistically significant (0.026 < 0.05). This indicates a statistically significant difference in mean pulse pressure between the cardiovascular and non-cardiovascular patient groups. Cardiovascular patients had a higher average pulse pressure (≈60.01 mmHg) compared to non-cardiovascular patients (≈57.90 mmHg) and this difference was statistically significant.
+
+However, this analysis has several limitations. The sample size was small, as the MIMIC-IV demo dataset includes only 100 patients and may not reflect the broader population. Additionally, the study did not adjust for key confounding variables such as patient age, gender, weight, BMI, or comorbid conditions (e.g., hypertension or diabetes), which are known to influence both pulse pressure and cardiovascular risk. A more comprehensive analysis using the full MIMIC-IV dataset and multivariate statistical methods is recommended to validate these findings.
